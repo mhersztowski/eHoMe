@@ -1,0 +1,167 @@
+#include "SymbolTable.h"
+#include "CodeGenerator.h"
+#include "wchar.h"
+
+COMPILER EHLang
+
+
+	int // types
+	  undef, integer, boolean;
+
+	int // object kinds
+	  var, proc;
+	
+	Logic* logic;
+	SymbolTable   *tab;
+	CodeGenerator *gen;
+
+	void Err(wchar_t* msg) {
+		errors->Error(la->line, la->col, msg);
+	}
+
+	void InitDeclarations() { // it must exist
+		undef = 0; integer = 1; boolean = 2; // types
+		var = 0; proc = 1; // object kinds
+
+	}
+
+
+  
+/*--------------------------------------------------------------------------*/
+CHARACTERS
+  letter = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".
+  digit = "0123456789".
+  cr  = '\r'.
+  lf  = '\n'.
+  tab = '\t'.
+
+TOKENS
+  ident  = letter {letter | digit}.
+  number = digit {digit}.
+
+COMMENTS FROM "/*" TO "*/" NESTED
+COMMENTS FROM "//" TO cr lf
+
+IGNORE cr + lf + tab
+
+
+
+PRODUCTIONS
+
+/*------------------------------------------------------------------------*/
+Expr<int &type>          (. int type1; Logic::Op op = Logic::UNKNOWN; .)
+= SimExpr<type>
+  [ 
+	( "=="                 (. op = Logic::EQU; .)
+	| '<'                  (. op = Logic::LSS; .)
+	| '>'                  (. op = Logic::GTR; .)
+	)
+    SimExpr<type1>       (.  logic->doExpr(type, type1, op); .)
+  ].
+/*------------------------------------------------------------------------*/
+SimExpr<int &type>       (. int type1; Logic::Op op = Logic::UNKNOWN; .)
+= Term<type>
+  { 
+	( '+'	                 (. op = Logic::PLUS; .)
+	| '-'                    (. op = Logic::MINUS; .)
+	)
+    Term<type1>      	(.  logic->doSimExpr(type, type1, op); .)
+	}.
+
+/*------------------------------------------------------------------------*/
+Term<int &type>          (. int type1; Logic::Op op = Logic::UNKNOWN; .)
+= Factor<type>
+  { 
+	( '*'                  (. op = Logic::TIMES; .)
+	| '/'                  (. op = Logic::SLASH; .)
+	)
+    Factor<type1>        (. logic->doTerm(type, type1, op); .)
+	}.
+/*------------------------------------------------------------------------*/
+Factor<int &type>        (.   wchar_t* name; .)
+=                        (. type = undef; .)
+  ( Ident<name>          (. logic->doFactorIdent(type, name); .)
+  | number               (. logic->doFactorNumber(type); .)
+  | '-'
+    Factor<type>         (. logic->doFactorNeg(type); .)
+  | "true"               (. logic->doFactorTrue(type); .)
+  | "false"              (. logic->doFactorFalse(type); .)
+  ).
+/*------------------------------------------------------------------------*/
+Ident<wchar_t* &name>
+= ident                  (. name = coco_string_create(t->val); .).
+               
+/*------------------------------------------------------------------------*/
+ProcDecl                 (. wchar_t* name;  int adr; .)
+= "void"
+  Ident<name>            (. lagic->doProcDeclIdent(name); .)
+  '(' ')'
+  '{'                    (. logic->doProcDeclEnter(adr); .)
+  { VarDecl | Stat }
+  '}'                    (. logic->doProcDeclLeave(adr); .).
+
+
+/*------------------------------------------------------------------------*/
+Stat                     (. int type; wchar_t* name; Obj *obj;
+                            int adr, adr2, loopstart; .)
+= Ident<name>            (. obj = tab->Find(name); .)
+  ( '='                  (. if (obj->kind != var) Err(L"cannot assign to procedure"); .)
+		Expr<type> ';'
+											   (. if (type != obj->type) Err(L"incompatible types");
+													  if (obj->level == 0) gen->Emit(CodeGenerator::STOG, obj->adr);
+													  else gen->Emit(CodeGenerator::STO, obj->adr); .)
+	| '(' ')' ';'          (. if (obj->kind != proc) Err(L"object is not a procedure");
+												  	gen->Emit(CodeGenerator::CALL, obj->adr); .)
+	)
+
+| "if" 
+	'(' Expr<type> ')' (. if (type != boolean) Err(L"boolean type expected");
+													  gen->Emit(CodeGenerator::FJMP, 0); adr = gen->pc - 2; .)
+	Stat
+	[ "else"               (. gen->Emit(CodeGenerator::JMP, 0); adr2 = gen->pc - 2;
+													  gen->Patch(adr, gen->pc);
+													  adr = adr2; .)
+		Stat 
+	]                      (. gen->Patch(adr, gen->pc); .)
+
+| "while"                (. loopstart = gen->pc; .)
+	'(' Expr<type> ')' (. if (type != boolean) Err(L"boolean type expected");
+													  gen->Emit(CodeGenerator::FJMP, 0); adr = gen->pc - 2; .)
+	Stat                   (. gen->Emit(CodeGenerator::JMP, loopstart); gen->Patch(adr, gen->pc); .)
+
+| "read"
+	Ident<name> ';'        (. obj = tab->Find(name);
+													  if (obj->type != integer) Err(L"integer type expected");
+													  gen->Emit(CodeGenerator::READ);
+													  if (obj->level == 0) gen->Emit(CodeGenerator::STOG, obj->adr);
+													  else gen->Emit(CodeGenerator::STO, obj->adr); .)
+
+| "write" 
+	Expr<type> ';'         (. if (type != integer) Err(L"integer type expected");
+												    gen->Emit(CodeGenerator::WRITE); .)
+
+| '{' { Stat | VarDecl } '}' .
+/*------------------------------------------------------------------------*/
+EHLang                    (. wchar_t* name;
+                            InitDeclarations(); .)
+= "program"
+  Ident<name>            (. tab->OpenScope(); .)
+  '{'
+  { VarDecl }
+  { ProcDecl }
+  '}'                    (. tab->CloseScope(); .).
+  
+/*------------------------------------------------------------------------*/
+Type<int &type>
+=                        (. type = undef; .)
+ ( "int"                 (. type = integer; .)
+ | "bool"                (. type = boolean; .)
+ ).
+/*------------------------------------------------------------------------*/
+VarDecl                  (. wchar_t* name; int type; .)
+= Type<type>
+  Ident<name>            (. tab->NewObj(name, var, type); .)
+  { ',' Ident<name>      (. tab->NewObj(name, var, type); .)
+  } ';'.
+
+END EHLang.
